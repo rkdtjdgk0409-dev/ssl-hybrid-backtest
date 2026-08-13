@@ -608,14 +608,120 @@ def _fetch_kospi200_hankyung() -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-def fetch_current_kospi200_online() -> pd.DataFrame:
-    """Fetch current KOSPI200 membership with automatic GitHub-safe fallback."""
+
+def _fetch_kospi200_naver() -> pd.DataFrame:
+    """
+    GitHub Actions-friendly KOSPI200 constituent fetcher using Naver Finance.
+
+    Naver exposes the KOSPI200 constituents in 20 server-rendered pages,
+    10 names per page. The stock code is embedded in links like
+    /item/main.naver?code=005930. This does not require a KRX login.
+    """
+    import re
+    import time
+    import requests
+    from bs4 import BeautifulSoup
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.7,en;q=0.6",
+        "Referer": "https://finance.naver.com/",
+    })
+
+    rows = []
+    seen = set()
     errors = []
+
+    for page in range(1, 21):
+        url = f"https://finance.naver.com/sise/entryJongmok.naver?&page={page}"
+        ok = False
+        for attempt in range(3):
+            try:
+                r = session.get(url, timeout=(8, 20))
+                r.raise_for_status()
+                # Naver Finance pages are traditionally EUC-KR/CP949.
+                # apparent_encoding is safer if headers are incomplete.
+                if not r.encoding or r.encoding.lower() in {"iso-8859-1", "ascii"}:
+                    r.encoding = r.apparent_encoding or "euc-kr"
+                soup = BeautifulSoup(r.text, "lxml")
+
+                found_this_page = 0
+                for td in soup.find_all("td", class_="ctg"):
+                    a = td.find("a", href=True)
+                    if not a:
+                        continue
+                    m = re.search(r"[?&]code=(\d{6})", a.get("href", ""))
+                    if not m:
+                        continue
+                    code = m.group(1)
+                    name = a.get_text(" ", strip=True) or td.get_text(" ", strip=True)
+                    if code not in seen:
+                        seen.add(code)
+                        rows.append((code, name))
+                        found_this_page += 1
+
+                # Generic link parser in case the td class changes.
+                if found_this_page == 0:
+                    for a in soup.find_all("a", href=True):
+                        m = re.search(r"[?&]code=(\d{6})", a.get("href", ""))
+                        if not m:
+                            continue
+                        code = m.group(1)
+                        name = a.get_text(" ", strip=True)
+                        if code not in seen and name:
+                            seen.add(code)
+                            rows.append((code, name))
+                            found_this_page += 1
+
+                if found_this_page > 0:
+                    ok = True
+                    break
+                errors.append(f"page {page}: parsed 0 constituents")
+            except Exception as e:
+                errors.append(f"page {page} attempt {attempt+1}: {type(e).__name__}: {e}")
+                time.sleep(1.0 + attempt)
+
+        if not ok:
+            print(f"Naver universe warning: page {page} could not be parsed")
+        if len(rows) >= 200:
+            break
+        time.sleep(0.15)
+
+    out = pd.DataFrame(rows, columns=["Code", "Name"]).drop_duplicates("Code")
+    # The endpoint is specifically the KOSPI200 constituent list; insist on exactly 200
+    # to prevent silently backtesting an incomplete universe.
+    if len(out) != 200:
+        tail = "\n".join(errors[-8:])
+        raise RuntimeError(
+            f"Naver KOSPI200 fetch returned {len(out)} unique constituents, expected 200."
+            + (f"\nRecent errors:\n{tail}" if tail else "")
+        )
+
+    out["Code"] = out["Code"].astype(str).str.zfill(6)
+    print(f"Universe source: Naver Finance ({len(out)} stocks)")
+    return out.reset_index(drop=True)
+
+def fetch_current_kospi200_online() -> pd.DataFrame:
+    """Fetch current KOSPI200 membership with multiple independent fallbacks."""
+    errors = []
+
+    # Naver first on GitHub Actions: it does not depend on the KRX OTP/login flow.
+    try:
+        return _fetch_kospi200_naver()
+    except Exception as e:
+        errors.append(f"Naver: {type(e).__name__}: {e}")
+        print("Naver universe fetch failed; trying pykrx...")
+        print(errors[-1])
+
     try:
         return _fetch_kospi200_pykrx()
     except Exception as e:
         errors.append(f"pykrx: {type(e).__name__}: {e}")
-        print("pykrx universe fetch failed; trying GitHub-safe fallback...")
+        print("pykrx universe fetch failed; trying Hankyung fallback...")
         print(errors[-1])
 
     try:
@@ -624,8 +730,8 @@ def fetch_current_kospi200_online() -> pd.DataFrame:
         errors.append(f"Hankyung: {type(e).__name__}: {e}")
 
     raise RuntimeError(
-        "Could not obtain the current KOSPI200 universe. "
-        "Use --universe-csv with a CSV containing Code,Name if both online sources fail.\n"
+        "Could not obtain the current KOSPI200 universe from Naver, pykrx, or Hankyung. "
+        "You can also pass --universe-csv with a CSV containing Code,Name.\n"
         + "\n".join(errors)
     )
 
