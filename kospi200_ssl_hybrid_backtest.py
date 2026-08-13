@@ -503,18 +503,17 @@ def load_universe_csv(path: str) -> pd.DataFrame:
     return u[["Code", "Name"]].drop_duplicates("Code").reset_index(drop=True)
 
 
-def fetch_current_kospi200_online() -> pd.DataFrame:
-    """Fetch the latest obtainable KOSPI200 membership and freeze it."""
+def _fetch_kospi200_pykrx() -> pd.DataFrame:
+    """Try KRX/pykrx first. GitHub-hosted runners are sometimes blocked by KRX."""
     from pykrx import stock
 
     idxs = stock.get_index_ticker_list(market="KOSPI")
     idx_code = next(c for c in idxs if stock.get_index_ticker_name(c) == "코스피 200")
 
-    # Try recent calendar dates because weekends/holidays may return nothing.
     today = pd.Timestamp.today().normalize()
     tickers = []
     used_date = None
-    for n in range(0, 15):
+    for n in range(0, 20):
         dt = today - pd.Timedelta(days=n)
         try:
             tickers = stock.get_index_portfolio_deposit_file(idx_code, dt.strftime("%Y%m%d"))
@@ -522,17 +521,112 @@ def fetch_current_kospi200_online() -> pd.DataFrame:
                 used_date = dt
                 break
         except Exception:
-            pass
+            continue
 
     if not tickers:
-        raise RuntimeError("Could not fetch current KOSPI200 constituents from pykrx.")
+        raise RuntimeError("pykrx returned no KOSPI200 constituents")
 
-    print(f"Frozen KOSPI200 universe date: {used_date.date() if used_date is not None else 'unknown'}")
-    return pd.DataFrame(
-        {
-            "Code": [str(t).zfill(6) for t in tickers],
-            "Name": [stock.get_market_ticker_name(t) for t in tickers],
-        }
+    out = pd.DataFrame({
+        "Code": [str(t).zfill(6) for t in tickers],
+        "Name": [stock.get_market_ticker_name(t) for t in tickers],
+    }).drop_duplicates("Code")
+    if len(out) < 190:
+        raise RuntimeError(f"pykrx returned only {len(out)} constituents")
+    print(f"Universe source: pykrx / KRX ({used_date.date() if used_date is not None else 'unknown'})")
+    return out.reset_index(drop=True)
+
+
+def _fetch_kospi200_hankyung() -> pd.DataFrame:
+    """
+    Fallback for GitHub Actions when KRX blocks datacenter IPs.
+
+    Korea Economic Daily exposes KOSPI200 component pages with the six-digit
+    ticker embedded in the stock-name column. We try several pages and collect
+    unique codes. This avoids requiring KRX_ID/KRX_PW secrets.
+    """
+    import re
+    from io import StringIO
+    import requests
+
+    base = "https://markets.hankyung.com/index-info/kospi200"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.7,en;q=0.6",
+    }
+    rows = []
+    seen = set()
+
+    # The site may render all constituents on one page or paginate them.
+    urls = [base] + [f"{base}?page={i}" for i in range(1, 21)]
+    for url in urls:
+        try:
+            r = requests.get(url, headers=headers, timeout=20)
+            r.raise_for_status()
+            html = r.text
+
+            # First parse HTML tables (most reliable when server-rendered).
+            try:
+                tables = pd.read_html(StringIO(html))
+            except Exception:
+                tables = []
+
+            for tab in tables:
+                for col in tab.columns:
+                    vals = tab[col].astype(str)
+                    for v in vals:
+                        m = re.search(r"(.+?)\s+(\d{6})(?:\s|$)", v.strip())
+                        if not m:
+                            continue
+                        name = re.sub(r"\s+", " ", m.group(1)).strip()
+                        code = m.group(2)
+                        if code not in seen:
+                            seen.add(code)
+                            rows.append((code, name))
+
+            # Also scan stock-detail links; useful if the visible table is JS-enhanced.
+            # Typical links contain a six-digit Korean ticker.
+            for m in re.finditer(r'href=["\'][^"\']*(?:code|item|stock)[^"\']*[=/](\d{6})[^"\']*["\'][^>]*>(.*?)</a>', html, re.I | re.S):
+                code = m.group(1)
+                name = re.sub(r"<[^>]+>", " ", m.group(2))
+                name = re.sub(r"\s+", " ", name).strip()
+                if code not in seen and name:
+                    seen.add(code)
+                    rows.append((code, name))
+
+            if len(rows) >= 200:
+                break
+        except Exception as e:
+            print(f"Hankyung universe fallback warning ({url}): {e}")
+
+    out = pd.DataFrame(rows, columns=["Code", "Name"]).drop_duplicates("Code")
+    if len(out) < 190:
+        raise RuntimeError(f"Hankyung fallback found only {len(out)} constituent codes")
+    if len(out) > 200:
+        out = out.iloc[:200].copy()
+    print(f"Universe source: Hankyung fallback ({len(out)} stocks)")
+    return out.reset_index(drop=True)
+
+
+def fetch_current_kospi200_online() -> pd.DataFrame:
+    """Fetch current KOSPI200 membership with automatic GitHub-safe fallback."""
+    errors = []
+    try:
+        return _fetch_kospi200_pykrx()
+    except Exception as e:
+        errors.append(f"pykrx: {type(e).__name__}: {e}")
+        print("pykrx universe fetch failed; trying GitHub-safe fallback...")
+        print(errors[-1])
+
+    try:
+        return _fetch_kospi200_hankyung()
+    except Exception as e:
+        errors.append(f"Hankyung: {type(e).__name__}: {e}")
+
+    raise RuntimeError(
+        "Could not obtain the current KOSPI200 universe. "
+        "Use --universe-csv with a CSV containing Code,Name if both online sources fail.\n"
+        + "\n".join(errors)
     )
 
 
