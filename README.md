@@ -34,3 +34,8 @@ TradingView SSL Hybrid 로직을 Python으로 옮긴 KOSPI200 백테스트입니
 pip install -r requirements.txt
 python kospi200_ssl_hybrid_backtest.py --online --out output
 ```
+
+## KOSPI200 constituent-count note
+The online universe loader accepts a current Naver KOSPI200 snapshot containing **195-200 unique stocks**. This avoids false failures when the live index/replication basket temporarily contains 199 listed constituents. A materially incomplete scrape (<195) still fails instead of silently running a truncated backtest.
+
+The backtest intentionally uses the **current constituent snapshot for the whole historical test window** (no survivorship-bias adjustment), as requested.

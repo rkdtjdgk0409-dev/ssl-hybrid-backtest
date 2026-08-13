@@ -692,17 +692,23 @@ def _fetch_kospi200_naver() -> pd.DataFrame:
         time.sleep(0.15)
 
     out = pd.DataFrame(rows, columns=["Code", "Name"]).drop_duplicates("Code")
-    # The endpoint is specifically the KOSPI200 constituent list; insist on exactly 200
-    # to prevent silently backtesting an incomplete universe.
-    if len(out) != 200:
+    # KOSPI200 can temporarily have fewer than 200 listed constituents (for example
+    # during deletion/replacement timing).  Do not fail merely because Naver returns
+    # 199 names.  Still reject clearly incomplete scrapes so we do not silently run
+    # a materially truncated universe.
+    n = len(out)
+    if n < 195 or n > 200:
         tail = "\n".join(errors[-8:])
         raise RuntimeError(
-            f"Naver KOSPI200 fetch returned {len(out)} unique constituents, expected 200."
+            f"Naver KOSPI200 fetch returned {n} unique constituents; expected a near-complete 195-200 snapshot."
             + (f"\nRecent errors:\n{tail}" if tail else "")
         )
 
     out["Code"] = out["Code"].astype(str).str.zfill(6)
-    print(f"Universe source: Naver Finance ({len(out)} stocks)")
+    if n < 200:
+        print(f"Universe source: Naver Finance ({n} stocks; accepted as current near-complete KOSPI200 snapshot)")
+    else:
+        print(f"Universe source: Naver Finance ({n} stocks)")
     return out.reset_index(drop=True)
 
 def fetch_current_kospi200_online() -> pd.DataFrame:
